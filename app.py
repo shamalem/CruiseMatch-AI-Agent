@@ -5,10 +5,12 @@ CruiseMatch AI - Autonomous Cruise Recommendation Agent
 This is the main application with all required API endpoints.
 
 Endpoints:
-- GET  /api/team_info           - Returns team information
-- GET  /api/agent_info          - Returns agent description and examples
-- GET  /api/model_architecture  - Returns architecture diagram (PNG)
-- POST /api/execute             - Main agent endpoint
+- GET  /                     - Frontend page
+- GET  /health              - Health check
+- GET  /api/team_info       - Returns team information
+- GET  /api/agent_info      - Returns agent description and examples
+- GET  /api/model_architecture - Returns architecture diagram (PNG)
+- POST /api/execute         - Main agent endpoint
 """
 
 import os
@@ -53,15 +55,9 @@ TEAM_INFO = {
 app = Flask(__name__)
 CORS(app)
 
-# Root endpoint so Render can detect HTTP service
-@app.get("/")
-def home():
-    return "CruiseMatch AI is running", 200
-
-# Health endpoint so Render can verify the port quickly
 @app.get("/health")
 def health():
-    return "ok", 200
+    return jsonify({"status": "ok"}), 200
 
 # ============================================================================
 # INITIALIZE CLIENTS (TRUE lazy-loading: import libs only when needed)
@@ -72,10 +68,9 @@ _pinecone_index = None
 _embedding_model = None
 
 def get_supabase():
-    """Create Supabase client only when needed, and import only when needed."""
     global _supabase
     if _supabase is None:
-        from supabase import create_client  # moved here
+        from supabase import create_client
         if not SUPABASE_KEY:
             raise RuntimeError("SUPABASE_KEY env var is missing")
         _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -83,10 +78,9 @@ def get_supabase():
 
 
 def get_pinecone_index():
-    """Create Pinecone index client only when needed, and import only when needed."""
     global _pinecone_index
     if _pinecone_index is None:
-        from pinecone import Pinecone  # moved here
+        from pinecone import Pinecone
         if not PINECONE_API_KEY:
             raise RuntimeError("PINECONE_API_KEY env var is missing")
         pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -95,13 +89,9 @@ def get_pinecone_index():
 
 
 def get_embedding_model():
-    """
-    Load embedding model only when needed.
-    This is the main one that can hang on startup if imported globally.
-    """
     global _embedding_model
     if _embedding_model is None:
-        from sentence_transformers import SentenceTransformer  # moved here
+        from sentence_transformers import SentenceTransformer
         _embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
     return _embedding_model
 
@@ -110,7 +100,6 @@ def get_embedding_model():
 # ============================================================================
 
 def call_llm(prompt, system_prompt=None, max_tokens=2000):
-    """Call LLMod.ai API"""
     headers = {
         "Authorization": f"Bearer {LLMOD_API_KEY}",
         "Content-Type": "application/json",
@@ -145,8 +134,6 @@ def call_llm(prompt, system_prompt=None, max_tokens=2000):
 # ============================================================================
 
 class QueryParser:
-    """Module 1: Parse user query to extract search parameters"""
-
     @staticmethod
     def parse(user_query):
         system_prompt = """You are a query parser for a cruise recommendation system.
@@ -178,8 +165,6 @@ Return ONLY valid JSON, no other text."""
 
 
 class CruiseSearcher:
-    """Module 2: Search for cruises using Pinecone and Supabase"""
-
     @staticmethod
     def search(query_text, filters=None, top_k=20):
         model = get_embedding_model()
@@ -253,8 +238,6 @@ class CruiseSearcher:
 
 
 class DestinationEvaluator:
-    """Module 3: Evaluate destinations based on experience preferences"""
-
     @staticmethod
     def evaluate(port_countries, experience_type):
         if not port_countries or not experience_type:
@@ -552,159 +535,6 @@ class CruiseMatchAgent:
 agent = CruiseMatchAgent()
 
 # ============================================================================
-# API ENDPOINTS
-# ============================================================================
-
-@app.route("/")
-def home():
-    return render_template_string(HTML_TEMPLATE)
-
-
-@app.route("/api/team_info", methods=["GET"])
-def team_info():
-    return jsonify(TEAM_INFO)
-
-
-@app.route("/api/agent_info", methods=["GET"])
-def agent_info():
-    return jsonify(
-        {
-            "description": "CruiseMatch AI is an autonomous cruise recommendation agent that helps travelers find the perfect cruise based on their preferences, budget, and desired experiences.",
-            "purpose": "To solve the problem of cruise selection by evaluating both the cruise itself (price, duration, cabin type) and the travel experience offered by departure/arrival locations (culture, nature, adventure).",
-            "prompt_template": {
-                "template": "Find me a {experience_type} cruise to {region} for {duration} nights under ${budget} with {cabin_type} cabin",
-            },
-            "prompt_examples": [
-                {
-                    "prompt": "Find me a romantic Caribbean cruise under $2000 for 7 nights",
-                    "full_response": "Based on your preferences for a romantic Caribbean getaway under $2000 for 7 nights, I recommend: 1) Royal Caribbean's Symphony of the Seas - 7 nights, Balcony cabin at $1,850...",
-                    "steps": [
-                        {
-                            "module": "QueryParser",
-                            "prompt": {},
-                            "response": {
-                                "budget_max": 2000,
-                                "region": "Caribbean",
-                                "duration_max": 7,
-                                "experience_type": "romantic",
-                            },
-                        },
-                        {"module": "CruiseSearcher", "prompt": {}, "response": {"num_results": 15}},
-                        {"module": "DestinationEvaluator", "prompt": {}, "response": {}},
-                        {"module": "ResponseGenerator", "prompt": {}, "response": {}},
-                    ],
-                }
-            ],
-        }
-    )
-
-
-@app.route("/api/model_architecture", methods=["GET"])
-def model_architecture():
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-
-        width, height = 900, 650
-        img = Image.new("RGB", (width, height), color="white")
-        draw = ImageDraw.Draw(img)
-
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
-            font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-        except Exception:
-            font = ImageFont.load_default()
-            font_title = font
-
-        draw.text((280, 20), "CruiseMatch AI Architecture", fill="black", font=font_title)
-
-        modules = [
-            (80, 80, 340, 140, "User Query Input", "#E3F2FD"),
-            (80, 160, 340, 220, "1. QueryParser\n(LLM: Extract parameters)", "#BBDEFB"),
-            (80, 240, 340, 300, "2. CruiseSearcher\n(Pinecone + Supabase)", "#90CAF9"),
-            (80, 320, 340, 380, "2b. ConstraintRelaxer\n(Duration→Cabin→Budget→Region)", "#7FB3FF"),
-            (80, 400, 340, 460, "3. DestinationEvaluator\n(Supabase: Experience scores)", "#64B5F6"),
-            (80, 480, 340, 540, "4. ResponseGenerator\n(LLM: Create response)", "#42A5F5"),
-            (80, 560, 340, 620, "Final Response + Steps", "#1E88E5"),
-        ]
-
-        datastores = [
-            (540, 220, 820, 280, "Pinecone\n(Vector embeddings)", "#C8E6C9"),
-            (540, 310, 820, 370, "Supabase\n(Cruise & Destination data)", "#A5D6A7"),
-            (540, 400, 820, 460, "LLMod.ai\n(GPT-5-Mini)", "#81C784"),
-        ]
-
-        for x1, y1, x2, y2, text, color in modules:
-            draw.rectangle([x1, y1, x2, y2], fill=color, outline="black", width=2)
-            draw.text((x1 + 10, y1 + 10), text, fill="black", font=font)
-
-        for x1, y1, x2, y2, text, color in datastores:
-            draw.rectangle([x1, y1, x2, y2], fill=color, outline="black", width=2)
-            draw.text((x1 + 10, y1 + 10), text, fill="black", font=font)
-
-        for i in range(len(modules) - 1):
-            y = modules[i][3]
-            draw.line([(210, y), (210, y + 20)], fill="black", width=2)
-            draw.polygon([(205, y + 15), (215, y + 15), (210, y + 20)], fill="black")
-
-        draw.line([(340, 270), (540, 250)], fill="green", width=2)
-        draw.line([(340, 270), (540, 340)], fill="green", width=2)
-        draw.line([(340, 190), (540, 430)], fill="blue", width=2)
-        draw.line([(340, 510), (540, 430)], fill="blue", width=2)
-
-        img_bytes = io.BytesIO()
-        img.save(img_bytes, format="PNG")
-        img_bytes.seek(0)
-        return send_file(img_bytes, mimetype="image/png")
-
-    except ImportError:
-        return jsonify({"error": "PIL not installed. Run: pip install Pillow"}), 500
-
-
-@app.route("/api/execute", methods=["POST"])
-def execute():
-    try:
-        data = request.get_json()
-        if not data or "prompt" not in data:
-            return (
-                jsonify(
-                    {
-                        "status": "error",
-                        "error": "Missing 'prompt' in request body",
-                        "response": None,
-                        "steps": [],
-                    }
-                ),
-                400,
-            )
-
-        user_prompt = data["prompt"]
-        result = agent.execute(user_prompt)
-
-        try:
-            supabase = get_supabase()
-            supabase.table("agent_logs").insert(
-                {
-                    "session_id": str(time.time()),
-                    "user_prompt": user_prompt,
-                    "agent_response": result.get("response"),
-                    "steps": json.dumps(result.get("steps", [])),
-                    "status": result.get("status"),
-                    "error_message": result.get("error"),
-                    "execution_time_ms": result.get("execution_time_ms"),
-                }
-            ).execute()
-        except Exception:
-            pass
-
-        return jsonify(result)
-
-    except Exception as e:
-        return (
-            jsonify({"status": "error", "error": str(e), "response": None, "steps": []}),
-            500,
-        )
-
-# ============================================================================
 # FRONTEND
 # ============================================================================
 
@@ -873,9 +703,15 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({ prompt })
                 });
 
+                if (!res.ok) {
+                    const text = await res.text();
+                    throw new Error(text || `HTTP ${res.status}`);
+                }
+
                 const data = await res.json();
 
-                document.getElementById('responseText').textContent = data.response || data.error || 'No response';
+                document.getElementById('responseText').textContent =
+                    data.response || data.error || 'No response';
 
                 const stepsHtml = (data.steps || []).map(step => `
                     <div class="step">
@@ -906,6 +742,158 @@ HTML_TEMPLATE = """
 </html>
 """
 
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
+@app.route("/")
+def home():
+    return render_template_string(HTML_TEMPLATE)
+
+
+@app.route("/api/team_info", methods=["GET"])
+def team_info():
+    return jsonify(TEAM_INFO)
+
+
+@app.route("/api/agent_info", methods=["GET"])
+def agent_info():
+    return jsonify(
+        {
+            "description": "CruiseMatch AI is an autonomous cruise recommendation agent that helps travelers find the perfect cruise based on their preferences, budget, and desired experiences.",
+            "purpose": "To solve the problem of cruise selection by evaluating both the cruise itself (price, duration, cabin type) and the travel experience offered by departure/arrival locations (culture, nature, adventure).",
+            "prompt_template": {
+                "template": "Find me a {experience_type} cruise to {region} for {duration} nights under ${budget} with {cabin_type} cabin",
+            },
+            "prompt_examples": [
+                {
+                    "prompt": "Find me a romantic Caribbean cruise under $2000 for 7 nights",
+                    "full_response": "Based on your preferences for a romantic Caribbean getaway under $2000 for 7 nights, I recommend: 1) Royal Caribbean's Symphony of the Seas - 7 nights, Balcony cabin at $1,850...",
+                    "steps": [
+                        {
+                            "module": "QueryParser",
+                            "prompt": {},
+                            "response": {
+                                "budget_max": 2000,
+                                "region": "Caribbean",
+                                "duration_max": 7,
+                                "experience_type": "romantic",
+                            },
+                        },
+                        {"module": "CruiseSearcher", "prompt": {}, "response": {"num_results": 15}},
+                        {"module": "DestinationEvaluator", "prompt": {}, "response": {}},
+                        {"module": "ResponseGenerator", "prompt": {}, "response": {}},
+                    ],
+                }
+            ],
+        }
+    )
+
+
+@app.route("/api/model_architecture", methods=["GET"])
+def model_architecture():
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+
+        width, height = 900, 650
+        img = Image.new("RGB", (width, height), color="white")
+        draw = ImageDraw.Draw(img)
+
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+            font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+        except Exception:
+            font = ImageFont.load_default()
+            font_title = font
+
+        draw.text((280, 20), "CruiseMatch AI Architecture", fill="black", font=font_title)
+
+        modules = [
+            (80, 80, 340, 140, "User Query Input", "#E3F2FD"),
+            (80, 160, 340, 220, "1. QueryParser\\n(LLM: Extract parameters)", "#BBDEFB"),
+            (80, 240, 340, 300, "2. CruiseSearcher\\n(Pinecone + Supabase)", "#90CAF9"),
+            (80, 320, 340, 380, "2b. ConstraintRelaxer\\n(Duration→Cabin→Budget→Region)", "#7FB3FF"),
+            (80, 400, 340, 460, "3. DestinationEvaluator\\n(Supabase: Experience scores)", "#64B5F6"),
+            (80, 480, 340, 540, "4. ResponseGenerator\\n(LLM: Create response)", "#42A5F5"),
+            (80, 560, 340, 620, "Final Response + Steps", "#1E88E5"),
+        ]
+
+        datastores = [
+            (540, 220, 820, 280, "Pinecone\\n(Vector embeddings)", "#C8E6C9"),
+            (540, 310, 820, 370, "Supabase\\n(Cruise & Destination data)", "#A5D6A7"),
+            (540, 400, 820, 460, "LLMod.ai\\n(GPT-5-Mini)", "#81C784"),
+        ]
+
+        for x1, y1, x2, y2, text, color in modules:
+            draw.rectangle([x1, y1, x2, y2], fill=color, outline="black", width=2)
+            draw.text((x1 + 10, y1 + 10), text, fill="black", font=font)
+
+        for x1, y1, x2, y2, text, color in datastores:
+            draw.rectangle([x1, y1, x2, y2], fill=color, outline="black", width=2)
+            draw.text((x1 + 10, y1 + 10), text, fill="black", font=font)
+
+        for i in range(len(modules) - 1):
+            y = modules[i][3]
+            draw.line([(210, y), (210, y + 20)], fill="black", width=2)
+            draw.polygon([(205, y + 15), (215, y + 15), (210, y + 20)], fill="black")
+
+        draw.line([(340, 270), (540, 250)], fill="green", width=2)
+        draw.line([(340, 270), (540, 340)], fill="green", width=2)
+        draw.line([(340, 190), (540, 430)], fill="blue", width=2)
+        draw.line([(340, 510), (540, 430)], fill="blue", width=2)
+
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format="PNG")
+        img_bytes.seek(0)
+        return send_file(img_bytes, mimetype="image/png")
+
+    except ImportError:
+        return jsonify({"error": "PIL not installed. Run: pip install Pillow"}), 500
+
+
+@app.route("/api/execute", methods=["POST"])
+def execute():
+    try:
+        data = request.get_json()
+        if not data or "prompt" not in data:
+            return (
+                jsonify(
+                    {
+                        "status": "error",
+                        "error": "Missing 'prompt' in request body",
+                        "response": None,
+                        "steps": [],
+                    }
+                ),
+                400,
+            )
+
+        user_prompt = data["prompt"]
+        result = agent.execute(user_prompt)
+
+        try:
+            supabase = get_supabase()
+            supabase.table("agent_logs").insert(
+                {
+                    "session_id": str(time.time()),
+                    "user_prompt": user_prompt,
+                    "agent_response": result.get("response"),
+                    "steps": json.dumps(result.get("steps", [])),
+                    "status": result.get("status"),
+                    "error_message": result.get("error"),
+                    "execution_time_ms": result.get("execution_time_ms"),
+                }
+            ).execute()
+        except Exception:
+            pass
+
+        return jsonify(result)
+
+    except Exception as e:
+        return (
+            jsonify({"status": "error", "error": str(e), "response": None, "steps": []}),
+            500,
+        )
 
 # ============================================================================
 # MAIN
@@ -914,9 +902,3 @@ HTML_TEMPLATE = """
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
-
-
-# ============================================================================
-# FRONTEND
-# ============================================================================
-
