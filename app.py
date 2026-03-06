@@ -2,15 +2,10 @@
 """
 CruiseMatch AI - Autonomous Cruise Recommendation Agent
 ========================================================
-This is the main application with all required API endpoints.
-
-Endpoints:
-- GET  /                     - Frontend page
-- GET  /health              - Health check
-- GET  /api/team_info       - Returns team information
-- GET  /api/agent_info      - Returns agent description and examples
-- GET  /api/model_architecture - Returns architecture diagram (PNG)
-- POST /api/execute         - Main agent endpoint
+Render-safe version:
+- No local sentence-transformers loading
+- No Torch model in web worker
+- Uses Pinecone metadata filtering and text query fallback
 """
 
 import os
@@ -22,7 +17,7 @@ from flask_cors import CORS
 import io
 
 # ============================================================================
-# CONFIGURATION (USE ENV VARS - DO NOT HARDCODE SECRETS)
+# CONFIGURATION
 # ============================================================================
 
 SUPABASE_URL = "https://qprqcxermzgogatflhgb.supabase.co"
@@ -55,17 +50,19 @@ TEAM_INFO = {
 app = Flask(__name__)
 CORS(app)
 
+
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"}), 200
 
+
 # ============================================================================
-# INITIALIZE CLIENTS (TRUE lazy-loading: import libs only when needed)
+# CLIENTS (LAZY LOADING)
 # ============================================================================
 
 _supabase = None
 _pinecone_index = None
-_embedding_model = None
+
 
 def get_supabase():
     global _supabase
@@ -88,18 +85,14 @@ def get_pinecone_index():
     return _pinecone_index
 
 
-def get_embedding_model():
-    global _embedding_model
-    if _embedding_model is None:
-        from sentence_transformers import SentenceTransformer
-        _embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-    return _embedding_model
-
 # ============================================================================
 # LLM FUNCTIONS
 # ============================================================================
 
 def call_llm(prompt, system_prompt=None, max_tokens=2000):
+    if not LLMOD_API_KEY:
+        return "Error calling LLM: LLMOD_API_KEY env var is missing"
+
     headers = {
         "Authorization": f"Bearer {LLMOD_API_KEY}",
         "Content-Type": "application/json",
@@ -128,6 +121,7 @@ def call_llm(prompt, system_prompt=None, max_tokens=2000):
         return result["choices"][0]["message"]["content"]
     except Exception as e:
         return f"Error calling LLM: {str(e)}"
+
 
 # ============================================================================
 # AGENT MODULES
@@ -165,13 +159,15 @@ Return ONLY valid JSON, no other text."""
 
 
 class CruiseSearcher:
+    """
+    Render-safe searcher:
+    - no local embeddings
+    - try Pinecone text query if supported
+    - otherwise use Supabase filtering fallback
+    """
+
     @staticmethod
-    def search(query_text, filters=None, top_k=20):
-        model = get_embedding_model()
-        query_embedding = model.encode(query_text).tolist()
-
-        index = get_pinecone_index()
-
+    def _build_filters(filters):
         pinecone_filter = {}
         if filters:
             if filters.get("region"):
@@ -184,57 +180,95 @@ class CruiseSearcher:
                 pinecone_filter["adults_only"] = {"$eq": True}
             if filters.get("cruise_line"):
                 pinecone_filter["cruise_line"] = {"$eq": filters["cruise_line"]}
+        return pinecone_filter
 
-        results = index.query(
-            vector=query_embedding,
-            top_k=top_k,
-            include_metadata=True,
-            namespace="cruises",
-            filter=pinecone_filter if pinecone_filter else None,
-        )
+    @staticmethod
+    def _query_supabase(filters=None, limit=20):
+        supabase = get_supabase()
+        q = supabase.table("cruises").select("*")
 
-        cruise_results = []
-        for match in results.matches:
-            cruise_results.append(
-                {
-                    "cruise_id": match.metadata.get("cruise_id"),
-                    "similarity_score": match.score,
-                    "metadata": match.metadata,
-                }
+        if filters:
+            if filters.get("region"):
+                q = q.eq("region", filters["region"])
+            if filters.get("cabin_type"):
+                q = q.eq("cabin_type", filters["cabin_type"])
+            if filters.get("family_friendly") is True:
+                q = q.eq("family_friendly", True)
+            if filters.get("adults_only") is True:
+                q = q.eq("adults_only", True)
+            if filters.get("cruise_line"):
+                q = q.eq("cruise_line", filters["cruise_line"])
+            if filters.get("budget_max") is not None:
+                q = q.lte("price_usd", filters["budget_max"])
+            if filters.get("budget_min") is not None:
+                q = q.gte("price_usd", filters["budget_min"])
+            if filters.get("duration_max") is not None:
+                q = q.lte("duration_nights", filters["duration_max"])
+            if filters.get("duration_min") is not None:
+                q = q.gte("duration_nights", filters["duration_min"])
+
+        result = q.limit(limit).execute()
+        return result.data or []
+
+    @staticmethod
+    def search(query_text, filters=None, top_k=20):
+        pinecone_filter = CruiseSearcher._build_filters(filters)
+
+        # Try Pinecone text query first if available in your SDK/index setup.
+        try:
+            index = get_pinecone_index()
+            results = index.search(
+                namespace="cruises",
+                query={
+                    "inputs": {"text": query_text},
+                    "top_k": top_k,
+                    "filter": pinecone_filter if pinecone_filter else None,
+                },
+                fields=["cruise_id", "region", "cabin_type", "cruise_line", "ship_name"]
             )
 
-        if filters and (
-            filters.get("budget_max") is not None
-            or filters.get("budget_min") is not None
-            or filters.get("duration_max") is not None
-            or filters.get("duration_min") is not None
-        ):
-            cruise_ids = [c["cruise_id"] for c in cruise_results if c.get("cruise_id")]
+            matches = results.get("result", {}).get("hits", []) if isinstance(results, dict) else []
+            if matches:
+                cruise_ids = []
+                score_map = {}
 
-            if cruise_ids:
-                supabase = get_supabase()
-                q = supabase.table("cruises").select("*").in_("cruise_id", cruise_ids)
+                for match in matches:
+                    fields = match.get("fields", {})
+                    cid = fields.get("cruise_id")
+                    if cid:
+                        cruise_ids.append(cid)
+                        score_map[cid] = match.get("_score", match.get("score"))
 
-                if filters.get("budget_max") is not None:
-                    q = q.lte("price_usd", filters["budget_max"])
-                if filters.get("budget_min") is not None:
-                    q = q.gte("price_usd", filters["budget_min"])
-                if filters.get("duration_max") is not None:
-                    q = q.lte("duration_nights", filters["duration_max"])
-                if filters.get("duration_min") is not None:
-                    q = q.gte("duration_nights", filters["duration_min"])
+                if cruise_ids:
+                    supabase = get_supabase()
+                    q = supabase.table("cruises").select("*").in_("cruise_id", cruise_ids)
 
-                result = q.execute()
-                db_cruises = {c["cruise_id"]: c for c in (result.data or [])}
+                    if filters:
+                        if filters.get("budget_max") is not None:
+                            q = q.lte("price_usd", filters["budget_max"])
+                        if filters.get("budget_min") is not None:
+                            q = q.gte("price_usd", filters["budget_min"])
+                        if filters.get("duration_max") is not None:
+                            q = q.lte("duration_nights", filters["duration_max"])
+                        if filters.get("duration_min") is not None:
+                            q = q.gte("duration_nights", filters["duration_min"])
 
-                merged = []
-                for cr in cruise_results:
-                    cid = cr.get("cruise_id")
-                    if cid in db_cruises:
-                        merged.append({**db_cruises[cid], "similarity_score": cr["similarity_score"]})
-                return merged
+                    db_result = q.execute()
+                    db_rows = db_result.data or []
 
-        return cruise_results
+                    merged = []
+                    for row in db_rows:
+                        row["similarity_score"] = score_map.get(row.get("cruise_id"))
+                        merged.append(row)
+
+                    if merged:
+                        return merged
+        except Exception:
+            # Ignore Pinecone text-search errors and fall back to Supabase.
+            pass
+
+        # Fallback: Supabase only
+        return CruiseSearcher._query_supabase(filters=filters, limit=top_k)
 
 
 class DestinationEvaluator:
@@ -481,7 +515,10 @@ class CruiseMatchAgent:
                 countries = list(
                     set(
                         [
-                            c.get("departure_country") or c.get("metadata", {}).get("departure_country")
+                            c.get("departure_country")
+                            or c.get("departure_port_country")
+                            or c.get("metadata", {}).get("departure_country")
+                            or c.get("metadata", {}).get("departure_port_country")
                             for c in cruises[:10]
                             if c
                         ]
@@ -704,8 +741,15 @@ HTML_TEMPLATE = """
                 });
 
                 if (!res.ok) {
-                    const text = await res.text();
-                    throw new Error(text || `HTTP ${res.status}`);
+                    let msg = `HTTP ${res.status}`;
+                    try {
+                        const errData = await res.json();
+                        msg = errData.error || errData.response || msg;
+                    } catch (_) {
+                        const text = await res.text();
+                        if (text) msg = text;
+                    }
+                    throw new Error(msg);
                 }
 
                 const data = await res.json();
@@ -811,7 +855,7 @@ def model_architecture():
         modules = [
             (80, 80, 340, 140, "User Query Input", "#E3F2FD"),
             (80, 160, 340, 220, "1. QueryParser\\n(LLM: Extract parameters)", "#BBDEFB"),
-            (80, 240, 340, 300, "2. CruiseSearcher\\n(Pinecone + Supabase)", "#90CAF9"),
+            (80, 240, 340, 300, "2. CruiseSearcher\\n(Pinecone/Supabase)", "#90CAF9"),
             (80, 320, 340, 380, "2b. ConstraintRelaxer\\n(Duration→Cabin→Budget→Region)", "#7FB3FF"),
             (80, 400, 340, 460, "3. DestinationEvaluator\\n(Supabase: Experience scores)", "#64B5F6"),
             (80, 480, 340, 540, "4. ResponseGenerator\\n(LLM: Create response)", "#42A5F5"),
@@ -819,9 +863,9 @@ def model_architecture():
         ]
 
         datastores = [
-            (540, 220, 820, 280, "Pinecone\\n(Vector embeddings)", "#C8E6C9"),
-            (540, 310, 820, 370, "Supabase\\n(Cruise & Destination data)", "#A5D6A7"),
-            (540, 400, 820, 460, "LLMod.ai\\n(GPT-5-Mini)", "#81C784"),
+            (540, 220, 820, 280, "Pinecone", "#C8E6C9"),
+            (540, 310, 820, 370, "Supabase", "#A5D6A7"),
+            (540, 400, 820, 460, "LLMod.ai", "#81C784"),
         ]
 
         for x1, y1, x2, y2, text, color in modules:
@@ -836,11 +880,6 @@ def model_architecture():
             y = modules[i][3]
             draw.line([(210, y), (210, y + 20)], fill="black", width=2)
             draw.polygon([(205, y + 15), (215, y + 15), (210, y + 20)], fill="black")
-
-        draw.line([(340, 270), (540, 250)], fill="green", width=2)
-        draw.line([(340, 270), (540, 340)], fill="green", width=2)
-        draw.line([(340, 190), (540, 430)], fill="blue", width=2)
-        draw.line([(340, 510), (540, 430)], fill="blue", width=2)
 
         img_bytes = io.BytesIO()
         img.save(img_bytes, format="PNG")
@@ -887,13 +926,15 @@ def execute():
         except Exception:
             pass
 
-        return jsonify(result)
+        status_code = 200 if result.get("status") == "ok" else 500
+        return jsonify(result), status_code
 
     except Exception as e:
         return (
             jsonify({"status": "error", "error": str(e), "response": None, "steps": []}),
             500,
         )
+
 
 # ============================================================================
 # MAIN
