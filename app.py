@@ -53,10 +53,15 @@ TEAM_INFO = {
 app = Flask(__name__)
 CORS(app)
 
-# ✅ Health endpoint so Render can verify the port quickly
+# Root endpoint so Render can detect HTTP service
+@app.get("/")
+def home():
+    return "CruiseMatch AI is running", 200
+
+# Health endpoint so Render can verify the port quickly
 @app.get("/health")
 def health():
-    return "OK", 200
+    return "ok", 200
 
 # ============================================================================
 # INITIALIZE CLIENTS (TRUE lazy-loading: import libs only when needed)
