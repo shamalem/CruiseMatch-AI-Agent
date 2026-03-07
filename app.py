@@ -165,7 +165,20 @@ class CruiseSearcher:
     - try Pinecone text query if supported
     - otherwise use Supabase filtering fallback
     """
+    @staticmethod
+    def region_exists(region_value):
+        if not region_value:
+            return True  # no region specified, so nothing to validate
 
+        supabase = get_supabase()
+        result = (
+            supabase.table("cruises")
+            .select("cruise_id")
+            .eq("region", region_value)
+            .limit(1)
+            .execute()
+        )
+        return bool(result.data)
     @staticmethod
     def _build_filters(filters):
         pinecone_filter = {}
@@ -426,146 +439,207 @@ class CruiseMatchAgent:
         self.response_generator = ResponseGenerator()
 
     def execute(self, user_prompt):
-        steps = []
-        start_time = time.time()
+    steps = []
+    start_time = time.time()
 
-        try:
-            step1_start = time.time()
-            parsed_params = self.query_parser.parse(user_prompt)
+    try:
+        # --------------------------------------------------
+        # 1) Parse user query
+        # --------------------------------------------------
+        step1_start = time.time()
+        parsed_params = self.query_parser.parse(user_prompt)
+        steps.append(
+            {
+                "module": "QueryParser",
+                "prompt": {"user_query": user_prompt},
+                "response": parsed_params,
+                "duration_ms": int((time.time() - step1_start) * 1000),
+            }
+        )
+
+        # --------------------------------------------------
+        # 2) Validate region before any relaxation
+        #    If region does not exist at all, stop early
+        # --------------------------------------------------
+        if parsed_params.get("region"):
+            region_check_start = time.time()
+            region_found = self.cruise_searcher.region_exists(parsed_params["region"])
             steps.append(
                 {
-                    "module": "QueryParser",
-                    "prompt": {"user_query": user_prompt},
-                    "response": parsed_params,
-                    "duration_ms": int((time.time() - step1_start) * 1000),
+                    "module": "RegionValidator",
+                    "prompt": {"region": parsed_params["region"]},
+                    "response": {"region_found": region_found},
+                    "duration_ms": int((time.time() - region_check_start) * 1000),
                 }
             )
 
-            step2_start = time.time()
-            cruises = self.cruise_searcher.search(user_prompt, parsed_params)
-            steps.append(
-                {
-                    "module": "CruiseSearcher",
-                    "prompt": {"query": user_prompt, "filters": parsed_params},
-                    "response": {"num_results": len(cruises), "top_cruises": cruises[:3]},
-                    "duration_ms": int((time.time() - step2_start) * 1000),
-                }
-            )
-
-            relax_attempts = 0
-            current_filters = dict(parsed_params or {})
-            already_relaxed = set()
-
-            TARGET_MIN_RESULTS = 3
-            MAX_RELAX_ATTEMPTS = 12
-
-            while (not cruises or len(cruises) < TARGET_MIN_RESULTS) and relax_attempts < MAX_RELAX_ATTEMPTS:
-                relax_attempts += 1
-                r_start = time.time()
-
-                new_filters, relax_info = self.constraint_relaxer.relax(current_filters, already_relaxed)
-
-                steps.append(
-                    {
-                        "module": "ConstraintRelaxer",
-                        "prompt": current_filters,
-                        "response": {
-                            "attempt": relax_attempts,
-                            "relax_info": relax_info,
-                            "new_filters": new_filters,
-                        },
-                        "duration_ms": int((time.time() - r_start) * 1000),
-                    }
-                )
-
-                if relax_info.get("changed") is None:
-                    break
-
-                s_start = time.time()
-                cruises = self.cruise_searcher.search(user_prompt, new_filters)
-                steps.append(
-                    {
-                        "module": "CruiseSearcher(Relaxed)",
-                        "prompt": {"query": user_prompt, "filters": new_filters},
-                        "response": {"num_results": len(cruises), "top_cruises": cruises[:3]},
-                        "duration_ms": int((time.time() - s_start) * 1000),
-                    }
-                )
-
-                current_filters = new_filters
-
-                if cruises and len(cruises) >= TARGET_MIN_RESULTS:
-                    break
-
-            if not cruises:
+            if not region_found:
                 total_time = int((time.time() - start_time) * 1000)
                 return {
                     "status": "ok",
                     "error": None,
-                    "response": "No cruises found even after relaxing constraints. Try changing budget/region/duration wording.",
+                    "response": f'No cruises were found for the region "{parsed_params["region"]}". Please try a different region.',
                     "steps": steps,
                     "execution_time_ms": total_time,
+                    "cruises": []
                 }
 
-            if parsed_params.get("experience_type") and cruises:
-                step3_start = time.time()
-                countries = list(
-                    set(
-                        [
-                            c.get("departure_country")
-                            or c.get("departure_port_country")
-                            or c.get("metadata", {}).get("departure_country")
-                            or c.get("metadata", {}).get("departure_port_country")
-                            for c in cruises[:10]
-                            if c
-                        ]
-                    )
-                )
-                countries = [c for c in countries if c]
+        # --------------------------------------------------
+        # 3) Initial search with exact parsed filters
+        # --------------------------------------------------
+        step2_start = time.time()
+        cruises = self.cruise_searcher.search(user_prompt, parsed_params)
+        steps.append(
+            {
+                "module": "CruiseSearcher",
+                "prompt": {"query": user_prompt, "filters": parsed_params},
+                "response": {"num_results": len(cruises), "top_cruises": cruises[:3]},
+                "duration_ms": int((time.time() - step2_start) * 1000),
+            }
+        )
 
-                dest_scores = self.destination_evaluator.evaluate(
-                    countries,
-                    parsed_params.get("experience_type"),
-                )
-                steps.append(
-                    {
-                        "module": "DestinationEvaluator",
-                        "prompt": {"countries": countries, "experience_type": parsed_params.get("experience_type")},
-                        "response": dest_scores,
-                        "duration_ms": int((time.time() - step3_start) * 1000),
-                    }
-                )
+        # --------------------------------------------------
+        # 4) Relax constraints only if region exists
+        # --------------------------------------------------
+        relax_attempts = 0
+        current_filters = dict(parsed_params or {})
+        already_relaxed = set()
 
-            step4_start = time.time()
-            response_text = self.response_generator.generate(user_prompt, cruises)
+        TARGET_MIN_RESULTS = 3
+        MAX_RELAX_ATTEMPTS = 12
+
+        while (not cruises or len(cruises) < TARGET_MIN_RESULTS) and relax_attempts < MAX_RELAX_ATTEMPTS:
+            relax_attempts += 1
+            r_start = time.time()
+
+            new_filters, relax_info = self.constraint_relaxer.relax(current_filters, already_relaxed)
+
             steps.append(
                 {
-                    "module": "ResponseGenerator",
-                    "prompt": {"user_query": user_prompt, "num_cruises": len(cruises)},
-                    "response": {"generated_text": (response_text[:200] + "...") if response_text else ""},
-                    "duration_ms": int((time.time() - step4_start) * 1000),
+                    "module": "ConstraintRelaxer",
+                    "prompt": current_filters,
+                    "response": {
+                        "attempt": relax_attempts,
+                        "relax_info": relax_info,
+                        "new_filters": new_filters,
+                    },
+                    "duration_ms": int((time.time() - r_start) * 1000),
                 }
             )
 
-            total_time = int((time.time() - start_time) * 1000)
+            if relax_info.get("changed") is None:
+                break
 
+            s_start = time.time()
+            cruises = self.cruise_searcher.search(user_prompt, new_filters)
+            steps.append(
+                {
+                    "module": "CruiseSearcher(Relaxed)",
+                    "prompt": {"query": user_prompt, "filters": new_filters},
+                    "response": {"num_results": len(cruises), "top_cruises": cruises[:3]},
+                    "duration_ms": int((time.time() - s_start) * 1000),
+                }
+            )
+
+            current_filters = new_filters
+
+            if cruises and len(cruises) >= TARGET_MIN_RESULTS:
+                break
+
+        # --------------------------------------------------
+        # 5) No results even after relaxation
+        # --------------------------------------------------
+        if not cruises:
+            total_time = int((time.time() - start_time) * 1000)
             return {
                 "status": "ok",
                 "error": None,
-                "response": response_text,
+                "response": "No cruises found even after relaxing constraints. Try changing budget, cabin type, duration, or region wording.",
                 "steps": steps,
                 "execution_time_ms": total_time,
+                "cruises": []
             }
 
-        except Exception as e:
+        # --------------------------------------------------
+        # 6) Optional destination scoring by experience type
+        # --------------------------------------------------
+        if parsed_params.get("experience_type") and cruises:
+            step3_start = time.time()
+            countries = list(
+                set(
+                    [
+                        c.get("departure_country")
+                        or c.get("departure_port_country")
+                        or c.get("metadata", {}).get("departure_country")
+                        or c.get("metadata", {}).get("departure_port_country")
+                        for c in cruises[:10]
+                        if c
+                    ]
+                )
+            )
+            countries = [c for c in countries if c]
+
+            dest_scores = self.destination_evaluator.evaluate(
+                countries,
+                parsed_params.get("experience_type"),
+            )
+            steps.append(
+                {
+                    "module": "DestinationEvaluator",
+                    "prompt": {
+                        "countries": countries,
+                        "experience_type": parsed_params.get("experience_type"),
+                    },
+                    "response": dest_scores,
+                    "duration_ms": int((time.time() - step3_start) * 1000),
+                }
+            )
+
+        # --------------------------------------------------
+        # 7) Generate final natural-language response
+        # --------------------------------------------------
+        step4_start = time.time()
+        response_text = self.response_generator.generate(user_prompt, cruises)
+        steps.append(
+            {
+                "module": "ResponseGenerator",
+                "prompt": {"user_query": user_prompt, "num_cruises": len(cruises)},
+                "response": {"generated_text": (response_text[:200] + "...") if response_text else ""},
+                "duration_ms": int((time.time() - step4_start) * 1000),
+            }
+        )
+
+        total_time = int((time.time() - start_time) * 1000)
+
+        return {
+            "status": "ok",
+            "error": None,
+            "response": response_text,
+            "steps": steps,
+            "execution_time_ms": total_time,
+            "cruises": cruises[:10]
+        }
+
+    except Exception as e:
+        msg = str(e)
+
+        if "statement timeout" in msg or "57014" in msg:
+            total_time = int((time.time() - start_time) * 1000)
             return {
-                "status": "error",
-                "error": str(e),
-                "response": None,
+                "status": "ok",
+                "error": None,
+                "response": "The search took too long because the request is too restrictive or too broad after relaxation. Please try changing the region, budget, duration, or cabin type.",
                 "steps": steps,
+                "execution_time_ms": total_time,
+                "cruises": []
             }
 
-
+        return {
+            "status": "error",
+            "error": msg,
+            "response": None,
+            "steps": steps,
+        }
 agent = CruiseMatchAgent()
 
 # ============================================================================
