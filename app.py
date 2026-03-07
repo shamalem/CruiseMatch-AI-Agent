@@ -344,18 +344,16 @@ class ConstraintRelaxer:
             already_relaxed.add("duration_max_+2")
             return f, {"changed": "duration_max", "from": old, "to": f["duration_max"], "rule": "duration +2"}
 
-        if f.get("cabin_type") is not None:
-            old = f["cabin_type"]
-            if old in ConstraintRelaxer.CABIN_ORDER:
-                idx = ConstraintRelaxer.CABIN_ORDER.index(old)
-                if idx < len(ConstraintRelaxer.CABIN_ORDER) - 1:
-                    f["cabin_type"] = ConstraintRelaxer.CABIN_ORDER[idx + 1]
-                else:
-                    f["cabin_type"] = None
-            else:
-                f["cabin_type"] = None
-
-            return f, {"changed": "cabin_type", "from": old, "to": f["cabin_type"], "rule": "cabin downgrade"}
+        if "cabin_any" not in already_relaxed and f.get("cabin_type") is not None:
+    old = f["cabin_type"]
+    f["cabin_type"] = None
+    already_relaxed.add("cabin_any")
+    return f, {
+        "changed": "cabin_type",
+        "from": old,
+        "to": None,
+        "rule": "remove cabin filter and allow any cabin type"
+    }
 
         if "cruise_line_drop" not in already_relaxed and f.get("cruise_line") is not None:
             old = f["cruise_line"]
