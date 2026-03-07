@@ -29,23 +29,6 @@ PINECONE_INDEX = "cruisematch"
 LLMOD_API_KEY = os.environ.get("LLMOD_API_KEY")
 LLMOD_BASE_URL = "https://api.llmod.ai/v1"
 
-MIN_CRUISE_NIGHTS = 3
-
-SUPPORTED_REGIONS = {
-    "Caribbean",
-    "Mediterranean",
-    "Alaska",
-    "Northern Europe",
-    "Asia Pacific",
-    "South America",
-    "Australia/New Zealand",
-    "Transatlantic",
-    "World Cruise",
-    "Hawaii",
-    "Bahamas",
-    "Mexico",
-}
-
 # ============================================================================
 # TEAM INFORMATION
 # ============================================================================
@@ -71,16 +54,6 @@ CORS(app)
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"}), 200
-
-
-# ============================================================================
-# HELPERS
-# ============================================================================
-
-def is_supported_region(region):
-    if not region:
-        return True
-    return region.strip() in SUPPORTED_REGIONS
 
 
 # ============================================================================
@@ -180,15 +153,7 @@ Return ONLY valid JSON, no other text."""
                 response = response.split("```json")[1].split("```")[0]
             elif "```" in response:
                 response = response.split("```")[1].split("```")[0]
-
-            parsed = json.loads(response.strip())
-
-            if parsed.get("duration_min") is not None:
-                parsed["duration_min"] = max(MIN_CRUISE_NIGHTS, int(parsed["duration_min"]))
-            if parsed.get("duration_max") is not None:
-                parsed["duration_max"] = max(MIN_CRUISE_NIGHTS, int(parsed["duration_max"]))
-
-            return parsed
+            return json.loads(response.strip())
         except Exception:
             return {}
 
@@ -219,47 +184,37 @@ class CruiseSearcher:
 
     @staticmethod
     def _query_supabase(filters=None, limit=20):
-        try:
-            supabase = get_supabase()
-            q = supabase.table("cruises").select(
-                "cruise_id,cruise_line,ship_name,region,duration_nights,cabin_type,"
-                "price_usd,rating,family_friendly,adults_only,all_inclusive,"
-                "departure_port_country,departure_country"
-            )
+        supabase = get_supabase()
+        q = supabase.table("cruises").select("*")
 
-            if filters:
-                if filters.get("region"):
-                    q = q.eq("region", filters["region"])
-                if filters.get("cabin_type"):
-                    q = q.eq("cabin_type", filters["cabin_type"])
-                if filters.get("family_friendly") is True:
-                    q = q.eq("family_friendly", True)
-                if filters.get("adults_only") is True:
-                    q = q.eq("adults_only", True)
-                if filters.get("cruise_line"):
-                    q = q.eq("cruise_line", filters["cruise_line"])
-                if filters.get("budget_max") is not None:
-                    q = q.lte("price_usd", filters["budget_max"])
-                if filters.get("budget_min") is not None:
-                    q = q.gte("price_usd", filters["budget_min"])
-                if filters.get("duration_max") is not None:
-                    q = q.lte("duration_nights", filters["duration_max"])
-                if filters.get("duration_min") is not None:
-                    q = q.gte("duration_nights", filters["duration_min"])
+        if filters:
+            if filters.get("region"):
+                q = q.eq("region", filters["region"])
+            if filters.get("cabin_type"):
+                q = q.eq("cabin_type", filters["cabin_type"])
+            if filters.get("family_friendly") is True:
+                q = q.eq("family_friendly", True)
+            if filters.get("adults_only") is True:
+                q = q.eq("adults_only", True)
+            if filters.get("cruise_line"):
+                q = q.eq("cruise_line", filters["cruise_line"])
+            if filters.get("budget_max") is not None:
+                q = q.lte("price_usd", filters["budget_max"])
+            if filters.get("budget_min") is not None:
+                q = q.gte("price_usd", filters["budget_min"])
+            if filters.get("duration_max") is not None:
+                q = q.lte("duration_nights", filters["duration_max"])
+            if filters.get("duration_min") is not None:
+                q = q.gte("duration_nights", filters["duration_min"])
 
-            result = q.limit(limit).execute()
-            return result.data or []
-
-        except Exception as e:
-            msg = str(e).lower()
-            if "statement timeout" in msg or "57014" in msg:
-                return []
-            raise
+        result = q.limit(limit).execute()
+        return result.data or []
 
     @staticmethod
     def search(query_text, filters=None, top_k=20):
         pinecone_filter = CruiseSearcher._build_filters(filters)
 
+        # Try Pinecone text query first if available in your SDK/index setup.
         try:
             index = get_pinecone_index()
             results = index.search(
@@ -286,11 +241,7 @@ class CruiseSearcher:
 
                 if cruise_ids:
                     supabase = get_supabase()
-                    q = supabase.table("cruises").select(
-                        "cruise_id,cruise_line,ship_name,region,duration_nights,cabin_type,"
-                        "price_usd,rating,family_friendly,adults_only,all_inclusive,"
-                        "departure_port_country,departure_country"
-                    ).in_("cruise_id", cruise_ids)
+                    q = supabase.table("cruises").select("*").in_("cruise_id", cruise_ids)
 
                     if filters:
                         if filters.get("budget_max") is not None:
@@ -302,7 +253,7 @@ class CruiseSearcher:
                         if filters.get("duration_min") is not None:
                             q = q.gte("duration_nights", filters["duration_min"])
 
-                    db_result = q.limit(top_k).execute()
+                    db_result = q.execute()
                     db_rows = db_result.data or []
 
                     merged = []
@@ -313,8 +264,10 @@ class CruiseSearcher:
                     if merged:
                         return merged
         except Exception:
+            # Ignore Pinecone text-search errors and fall back to Supabase.
             pass
 
+        # Fallback: Supabase only
         return CruiseSearcher._query_supabase(filters=filters, limit=top_k)
 
 
@@ -353,18 +306,14 @@ class DestinationEvaluator:
 
 
 class ConstraintRelaxer:
+    CABIN_ORDER = ["Penthouse Suite", "Suite", "Balcony", "Ocean View", "Inside"]
+
     @staticmethod
     def _normalize(filters: dict) -> dict:
         f = dict(filters or {})
         for k, v in list(f.items()):
             if isinstance(v, str) and v.strip() == "":
                 f[k] = None
-
-        if f.get("duration_min") is not None:
-            f["duration_min"] = max(MIN_CRUISE_NIGHTS, int(f["duration_min"]))
-        if f.get("duration_max") is not None:
-            f["duration_max"] = max(MIN_CRUISE_NIGHTS, int(f["duration_max"]))
-
         return f
 
     @staticmethod
@@ -373,80 +322,55 @@ class ConstraintRelaxer:
 
         if "duration_min_-1" not in already_relaxed and f.get("duration_min") is not None:
             old = int(f["duration_min"])
-            f["duration_min"] = max(MIN_CRUISE_NIGHTS, old - 1)
+            f["duration_min"] = max(1, old - 1)
             already_relaxed.add("duration_min_-1")
-            return f, {
-                "changed": "duration_min",
-                "from": old,
-                "to": f["duration_min"],
-                "rule": "duration -1",
-            }
+            return f, {"changed": "duration_min", "from": old, "to": f["duration_min"], "rule": "duration -1"}
 
         if "duration_max_+1" not in already_relaxed and f.get("duration_max") is not None:
             old = int(f["duration_max"])
-            f["duration_max"] = max(MIN_CRUISE_NIGHTS, old + 1)
+            f["duration_max"] = old + 1
             already_relaxed.add("duration_max_+1")
-            return f, {
-                "changed": "duration_max",
-                "from": old,
-                "to": f["duration_max"],
-                "rule": "duration +1",
-            }
+            return f, {"changed": "duration_max", "from": old, "to": f["duration_max"], "rule": "duration +1"}
 
         if "duration_min_-2" not in already_relaxed and f.get("duration_min") is not None:
             old = int(f["duration_min"])
-            f["duration_min"] = max(MIN_CRUISE_NIGHTS, old - 2)
+            f["duration_min"] = max(1, old - 2)
             already_relaxed.add("duration_min_-2")
-            return f, {
-                "changed": "duration_min",
-                "from": old,
-                "to": f["duration_min"],
-                "rule": "duration -2",
-            }
+            return f, {"changed": "duration_min", "from": old, "to": f["duration_min"], "rule": "duration -2"}
 
         if "duration_max_+2" not in already_relaxed and f.get("duration_max") is not None:
             old = int(f["duration_max"])
-            f["duration_max"] = max(MIN_CRUISE_NIGHTS, old + 2)
+            f["duration_max"] = old + 2
             already_relaxed.add("duration_max_+2")
-            return f, {
-                "changed": "duration_max",
-                "from": old,
-                "to": f["duration_max"],
-                "rule": "duration +2",
-            }
+            return f, {"changed": "duration_max", "from": old, "to": f["duration_max"], "rule": "duration +2"}
 
         if "cabin_any" not in already_relaxed and f.get("cabin_type") is not None:
-            old = f["cabin_type"]
-            f["cabin_type"] = None
-            already_relaxed.add("cabin_any")
-            return f, {
+           old = f["cabin_type"]
+           f["cabin_type"] = None
+           already_relaxed.add("cabin_any")
+           return f, {
                 "changed": "cabin_type",
                 "from": old,
                 "to": None,
-                "rule": "remove cabin filter and allow any cabin type",
+                "rule": "remove cabin filter and allow any cabin type"
             }
+        if "cruise_line_drop" not in already_relaxed and f.get("cruise_line") is not None:
+            old = f["cruise_line"]
+            f["cruise_line"] = None
+            already_relaxed.add("cruise_line_drop")
+            return f, {"changed": "cruise_line", "from": old, "to": None, "rule": "drop cruise_line"}
 
         if "budget_+25" not in already_relaxed and f.get("budget_max") is not None:
             old = int(f["budget_max"])
             f["budget_max"] = int(old * 1.25)
             already_relaxed.add("budget_+25")
-            return f, {
-                "changed": "budget_max",
-                "from": old,
-                "to": f["budget_max"],
-                "rule": "budget +25% (once)",
-            }
+            return f, {"changed": "budget_max", "from": old, "to": f["budget_max"], "rule": "budget +25% (once)"}
 
         if "region_drop" not in already_relaxed and f.get("region") is not None:
             old = f["region"]
             f["region"] = None
             already_relaxed.add("region_drop")
-            return f, {
-                "changed": "region",
-                "from": old,
-                "to": None,
-                "rule": "drop region (last resort)",
-            }
+            return f, {"changed": "region", "from": old, "to": None, "rule": "drop region (last resort)"}
 
         return f, {"changed": None}
 
@@ -517,26 +441,6 @@ class CruiseMatchAgent:
                 }
             )
 
-            if parsed_params.get("region") and not is_supported_region(parsed_params.get("region")):
-                total_time = int((time.time() - start_time) * 1000)
-                return {
-                    "status": "ok",
-                    "error": None,
-                    "response": f"No cruises found for the region '{parsed_params.get('region')}'. Try changing the region.",
-                    "steps": steps + [
-                        {
-                            "module": "RegionValidator",
-                            "prompt": {"region": parsed_params.get("region")},
-                            "response": {
-                                "supported": False,
-                                "allowed_regions": sorted(list(SUPPORTED_REGIONS)),
-                            },
-                            "duration_ms": 0,
-                        }
-                    ],
-                    "execution_time_ms": total_time,
-                }
-
             step2_start = time.time()
             cruises = self.cruise_searcher.search(user_prompt, parsed_params)
             steps.append(
@@ -553,7 +457,7 @@ class CruiseMatchAgent:
             already_relaxed = set()
 
             TARGET_MIN_RESULTS = 3
-            MAX_RELAX_ATTEMPTS = 7
+            MAX_RELAX_ATTEMPTS = 12
 
             while (not cruises or len(cruises) < TARGET_MIN_RESULTS) and relax_attempts < MAX_RELAX_ATTEMPTS:
                 relax_attempts += 1
@@ -598,7 +502,7 @@ class CruiseMatchAgent:
                 return {
                     "status": "ok",
                     "error": None,
-                    "response": "No cruises found even after relaxing constraints. Try changing budget, region, or duration wording.",
+                    "response": "No cruises found even after relaxing constraints. Try changing budget/region/duration wording.",
                     "steps": steps,
                     "execution_time_ms": total_time,
                 }
@@ -1036,3 +940,5 @@ def execute():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
+edit this ,
