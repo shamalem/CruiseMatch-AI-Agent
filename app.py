@@ -347,8 +347,13 @@ class ConstraintRelaxer:
         if "cabin_any" not in already_relaxed and f.get("cabin_type") is not None:
            old = f["cabin_type"]
            f["cabin_type"] = None
-          already_relaxed.add("cabin_any")
-          return f, {  "changed": "cabin_type",  "from": old, "to": None,"rule": "remove cabin filter and allow any cabin type" }
+           already_relaxed.add("cabin_any")
+           return f, {
+                "changed": "cabin_type",
+                "from": old,
+                "to": None,
+                "rule": "remove cabin filter and allow any cabin type"
+            }
         if "cruise_line_drop" not in already_relaxed and f.get("cruise_line") is not None:
             old = f["cruise_line"]
             f["cruise_line"] = None
